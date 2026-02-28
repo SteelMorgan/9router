@@ -175,8 +175,32 @@ function openaiToGeminiBase(model, body, stream) {
   // Convert tools
   if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
     const functionDeclarations = [];
+    let hasGoogleSearch = false;
+
     for (const t of body.tools) {
-      // Check if already in Anthropic/Claude format (no type field, direct name/description/input_schema)
+      // Map OpenAI hosted tools to Gemini native equivalents
+      if (t.type === "web_search") {
+        // web_search → Gemini google_search grounding
+        hasGoogleSearch = true;
+        continue;
+      }
+      if (t.type === "computer_use") {
+        // computer_use → Gemini computer_use (browser environment)
+        result.tools = result.tools || [];
+        result.tools.push({ computer_use: { environment: "ENVIRONMENT_BROWSER" } });
+        continue;
+      }
+      if (t.type === "code_interpreter") {
+        // code_interpreter → Gemini code_execution
+        result.tools = result.tools || [];
+        result.tools.push({ code_execution: {} });
+        continue;
+      }
+      // Other unnamed hosted tools with no Gemini equivalent — skip
+      if (t.type !== "function" && !t.name && !t.input_schema) {
+        continue;
+      }
+      // Anthropic/Claude format (no type field, direct name/description/input_schema)
       if (t.name && t.input_schema) {
         functionDeclarations.push({
           name: t.name,
@@ -184,7 +208,7 @@ function openaiToGeminiBase(model, body, stream) {
           parameters: t.input_schema || { type: "object", properties: {} }
         });
       }
-      // OpenAI format
+      // OpenAI Chat Completions format: { type: "function", function: { name, ... } }
       else if (t.type === "function" && t.function) {
         const fn = t.function;
         functionDeclarations.push({
@@ -195,8 +219,16 @@ function openaiToGeminiBase(model, body, stream) {
       }
     }
 
+    result.tools = [];
+    // google_search grounding must be a separate element in the tools array
+    if (hasGoogleSearch) {
+      result.tools.push({ google_search: {} });
+    }
     if (functionDeclarations.length > 0) {
-      result.tools = [{ functionDeclarations }];
+      result.tools.push({ functionDeclarations });
+    }
+    if (result.tools.length === 0) {
+      delete result.tools;
     }
   }
 
