@@ -178,13 +178,25 @@ function openaiToGeminiBase(model, body, stream) {
     let hasGoogleSearch = false;
 
     for (const t of body.tools) {
-      // OpenAI hosted tool: web_search → Gemini native google_search grounding
+      // Map OpenAI hosted tools to Gemini native equivalents
       if (t.type === "web_search") {
+        // web_search → Gemini google_search grounding
         hasGoogleSearch = true;
         continue;
       }
-      // Other unnamed hosted tools (computer_use, code_interpreter, etc.) — skip,
-      // they have no Gemini equivalent in function-calling API
+      if (t.type === "computer_use") {
+        // computer_use → Gemini computer_use (browser environment)
+        result.tools = result.tools || [];
+        result.tools.push({ computer_use: { environment: "ENVIRONMENT_BROWSER" } });
+        continue;
+      }
+      if (t.type === "code_interpreter") {
+        // code_interpreter → Gemini code_execution
+        result.tools = result.tools || [];
+        result.tools.push({ code_execution: {} });
+        continue;
+      }
+      // Other unnamed hosted tools with no Gemini equivalent — skip
       if (t.type !== "function" && !t.name && !t.input_schema) {
         continue;
       }
