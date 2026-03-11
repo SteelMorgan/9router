@@ -8,6 +8,8 @@ import {
   isValidApiKey,
 } from "../services/auth.js";
 import { getSettings } from "@/lib/localDb";
+import { isModelAllowed } from "../services/modelAccess.js";
+import { getCachedApiKeyRecord } from "../services/apiKeyCache.js";
 import { getModelInfo, getComboModels } from "../services/model.js";
 import { handleChatCore } from "open-sse/handlers/chatCore.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
@@ -81,6 +83,18 @@ export async function handleChat(request, clientRawRequest = null) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing model");
   }
 
+  // Check per-key model restrictions (only for active keys with restrictions)
+  if (apiKey) {
+    const keyRecord = await getCachedApiKeyRecord(apiKey);
+    if (keyRecord?.isActive !== false && keyRecord?.allowedModels?.length > 0) {
+      const allowed = await isModelAllowed(modelStr, keyRecord.allowedModels);
+      if (!allowed) {
+        log.warn("AUTH", `Model "${modelStr}" not allowed for key "${keyRecord.name}"`);
+        return errorResponse(HTTP_STATUS.FORBIDDEN, `Model "${modelStr}" is not allowed for this API key`);
+      }
+    }
+  }
+
   // Check if model is a combo (has multiple models with fallback)
   const comboModels = await getComboModels(modelStr);
   if (comboModels) {
@@ -111,7 +125,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       return handleComboChat({
         body,
         models: comboModels,
-        handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, forceSourceFormat),
+        handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
         log
       });
     }
