@@ -2,11 +2,13 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import ProviderIcon from "@/shared/components/ProviderIcon";
-import ProviderLimitCard from "./ProviderLimitCard";
 import QuotaTable from "./QuotaTable";
-import { parseQuotaData, calculatePercentage } from "./utils";
+import Toggle from "@/shared/components/Toggle";
+import { parseQuotaData, calculatePercentage, formatResetTime } from "./utils";
 import Card from "@/shared/components/Card";
 import Button from "@/shared/components/Button";
+import Badge from "@/shared/components/Badge";
+import { EditConnectionModal } from "@/shared/components";
 import { USAGE_SUPPORTED_PROVIDERS } from "@/shared/constants/providers";
 
 const REFRESH_INTERVAL_MS = 60000; // 60 seconds
@@ -21,6 +23,12 @@ export default function ProviderLimits() {
   const [refreshingAll, setRefreshingAll] = useState(false);
   const [countdown, setCountdown] = useState(60);
   const [connectionsLoading, setConnectionsLoading] = useState(true);
+  const [deletingId, setDeletingId] = useState(null);
+  const [togglingId, setTogglingId] = useState(null);
+  const [showEditModal, setShowEditModal] = useState(false);
+  const [selectedConnection, setSelectedConnection] = useState(null);
+  const [proxyPools, setProxyPools] = useState([]);
+  const [reserveStates, setReserveStates] = useState({});
 
   const intervalRef = useRef(null);
   const countdownRef = useRef(null);
@@ -114,6 +122,19 @@ export default function ProviderLimits() {
     }
   }, []);
 
+  // Fetch reserve states from background monitor
+  const fetchReserveStates = useCallback(async () => {
+    try {
+      const res = await fetch("/api/quota-reserve");
+      if (res.ok) {
+        const data = await res.json();
+        setReserveStates(data.states || {});
+      }
+    } catch {
+      // Silently ignore — reserve states are optional
+    }
+  }, []);
+
   // Refresh quota for a specific provider
   const refreshProvider = useCallback(
     async (connectionId, provider) => {
@@ -122,6 +143,97 @@ export default function ProviderLimits() {
     },
     [fetchQuota],
   );
+
+  const handleDeleteConnection = useCallback(async (id) => {
+    if (!confirm("Delete this connection?")) return;
+    setDeletingId(id);
+    try {
+      const res = await fetch(`/api/providers/${id}`, { method: "DELETE" });
+      if (res.ok) {
+        setConnections((prev) => prev.filter((c) => c.id !== id));
+        setQuotaData((prev) => {
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
+        setLoading((prev) => {
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
+        setErrors((prev) => {
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
+      }
+    } catch (error) {
+      console.error("Error deleting connection:", error);
+    } finally {
+      setDeletingId(null);
+    }
+  }, []);
+
+  const handleToggleConnectionActive = useCallback(async (id, isActive) => {
+    setTogglingId(id);
+    try {
+      const res = await fetch(`/api/providers/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ isActive }),
+      });
+      if (res.ok) {
+        setConnections((prev) =>
+          prev.map((c) => (c.id === id ? { ...c, isActive } : c)),
+        );
+      }
+    } catch (error) {
+      console.error("Error updating connection status:", error);
+    } finally {
+      setTogglingId(null);
+    }
+  }, []);
+
+  const handleUpdateConnection = useCallback(
+    async (formData) => {
+      if (!selectedConnection?.id) return;
+      const connectionId = selectedConnection.id;
+      const provider = selectedConnection.provider;
+      try {
+        const res = await fetch(`/api/providers/${connectionId}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(formData),
+        });
+        if (res.ok) {
+          await fetchConnections();
+          setShowEditModal(false);
+          setSelectedConnection(null);
+          if (USAGE_SUPPORTED_PROVIDERS.includes(provider)) {
+            await fetchQuota(connectionId, provider);
+          }
+        }
+      } catch (error) {
+        console.error("Error saving connection:", error);
+      }
+    },
+    [selectedConnection, fetchConnections, fetchQuota],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/proxy-pools?isActive=true", { cache: "no-store" })
+      .then((res) => res.json())
+      .then((data) => {
+        if (!cancelled && data?.proxyPools) {
+          setProxyPools(data.proxyPools);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Refresh all providers
   const refreshAll = useCallback(async () => {
@@ -140,10 +252,11 @@ export default function ProviderLimits() {
           conn.authType === "oauth",
       );
 
-      // Fetch quota for supported OAuth connections only
-      await Promise.all(
-        oauthConnections.map((conn) => fetchQuota(conn.id, conn.provider)),
-      );
+      // Fetch quota and reserve states in parallel
+      await Promise.all([
+        Promise.all(oauthConnections.map((conn) => fetchQuota(conn.id, conn.provider))),
+        fetchReserveStates(),
+      ]);
 
       setLastUpdated(new Date());
     } catch (error) {
@@ -151,7 +264,7 @@ export default function ProviderLimits() {
     } finally {
       setRefreshingAll(false);
     }
-  }, [refreshingAll, fetchConnections, fetchQuota]);
+  }, [refreshingAll, fetchConnections, fetchQuota, fetchReserveStates]);
 
   // Initial load: fetch connections first so cards render immediately, then fetch quotas
   useEffect(() => {
@@ -173,9 +286,10 @@ export default function ProviderLimits() {
       });
       setLoading(loadingState);
 
-      await Promise.all(
-        oauthConnections.map((conn) => fetchQuota(conn.id, conn.provider)),
-      );
+      await Promise.all([
+        Promise.all(oauthConnections.map((conn) => fetchQuota(conn.id, conn.provider))),
+        fetchReserveStates(),
+      ]);
       setLastUpdated(new Date());
     };
 
@@ -358,81 +472,194 @@ export default function ProviderLimits() {
         </div>
       </div>
 
-      {/* Provider Cards Grid */}
-      <div className="flex flex-col gap-4">
+      {/* Provider cards: 2 columns, compact */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
         {sortedConnections.map((conn) => {
           const quota = quotaData[conn.id];
           const isLoading = loading[conn.id];
           const error = errors[conn.id];
 
           // Use table layout for all providers
+          const isInactive = conn.isActive === false;
+          const rowBusy = deletingId === conn.id || togglingId === conn.id;
+
           return (
-            <Card key={conn.id} padding="none">
-              <div className="p-6 border-b border-black/10 dark:border-white/10">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-lg flex items-center justify-center overflow-hidden">
+            <Card
+              key={conn.id}
+              padding="none"
+              className={`min-w-0 ${isInactive ? "opacity-60" : ""}`}
+            >
+              <div className="px-4 py-3 border-b border-black/10 dark:border-white/10">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <div className="w-8 h-8 shrink-0 rounded-md flex items-center justify-center overflow-hidden">
                       <ProviderIcon
                         src={`/providers/${conn.provider}.png`}
                         alt={conn.provider}
-                        size={40}
+                        size={32}
                         className="object-contain"
                         fallbackText={
                           conn.provider?.slice(0, 2).toUpperCase() || "PR"
                         }
                       />
                     </div>
-                    <div>
-                      <h3 className="text-base font-semibold text-text-primary capitalize">
+                    <div className="min-w-0">
+                      <h3 className="text-sm font-semibold text-text-primary capitalize truncate">
                         {conn.provider}
                       </h3>
                       {conn.name && (
-                        <p className="text-sm text-text-muted">{conn.name}</p>
+                        <p className="text-xs text-text-muted truncate">
+                          {conn.name}
+                        </p>
                       )}
                     </div>
                   </div>
 
-                  <button
-                    onClick={() => refreshProvider(conn.id, conn.provider)}
-                    disabled={isLoading}
-                    className="p-2 rounded-lg hover:bg-black/5 dark:hover:bg-white/5 transition-colors disabled:opacity-50"
-                    title="Refresh quota"
-                  >
-                    <span
-                      className={`material-symbols-outlined text-[20px] text-text-muted ${isLoading ? "animate-spin" : ""}`}
+                  <div className="flex items-center gap-1 shrink-0">
+                    {/* Quota reserve/cooldown badges */}
+                    {reserveStates[conn.id]?.quotaReserveBlocked && (
+                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-orange-500/15 text-orange-600 dark:text-orange-400 whitespace-nowrap" title="Quota below minimum reserve threshold">
+                        <span className="material-symbols-outlined text-[12px]">shield</span>
+                        Reserve limit
+                      </span>
+                    )}
+                    {reserveStates[conn.id]?.cooldownUntil && reserveStates[conn.id].cooldownUntil > Date.now() && !reserveStates[conn.id]?.quotaReserveBlocked && (
+                      <CooldownBadge until={reserveStates[conn.id].cooldownUntil} />
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => refreshProvider(conn.id, conn.provider)}
+                      disabled={isLoading || rowBusy}
+                      className="p-1.5 rounded-lg hover:bg-black/5 dark:hover:bg-white/5 transition-colors disabled:opacity-50"
+                      title="Refresh quota"
                     >
-                      refresh
-                    </span>
-                  </button>
+                      <span
+                        className={`material-symbols-outlined text-[18px] text-text-muted ${isLoading ? "animate-spin" : ""}`}
+                      >
+                        refresh
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedConnection(conn);
+                        setShowEditModal(true);
+                      }}
+                      disabled={rowBusy}
+                      className="p-1.5 rounded-lg hover:bg-black/5 dark:hover:bg-white/5 text-text-muted hover:text-primary transition-colors disabled:opacity-50"
+                      title="Edit connection"
+                    >
+                      <span className="material-symbols-outlined text-[18px]">
+                        edit
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteConnection(conn.id)}
+                      disabled={rowBusy}
+                      className="p-1.5 rounded-lg hover:bg-red-500/10 text-red-500 transition-colors disabled:opacity-50"
+                      title="Delete connection"
+                    >
+                      <span
+                        className={`material-symbols-outlined text-[18px] ${deletingId === conn.id ? "animate-pulse" : ""}`}
+                      >
+                        delete
+                      </span>
+                    </button>
+                    <div
+                      className="inline-flex items-center pl-0.5"
+                      title={
+                        (conn.isActive ?? true)
+                          ? "Disable connection"
+                          : "Enable connection"
+                      }
+                    >
+                      <Toggle
+                        size="sm"
+                        checked={conn.isActive ?? true}
+                        disabled={rowBusy}
+                        onChange={(nextActive) =>
+                          handleToggleConnectionActive(conn.id, nextActive)
+                        }
+                      />
+                    </div>
+                  </div>
                 </div>
               </div>
 
-              <div className="p-6">
+              <div className="px-3 py-3">
                 {isLoading ? (
-                  <div className="text-center py-8 text-text-muted">
-                    <span className="material-symbols-outlined text-[32px] animate-spin">
+                  <div className="text-center py-5 text-text-muted">
+                    <span className="material-symbols-outlined text-[28px] animate-spin">
                       progress_activity
                     </span>
                   </div>
                 ) : error ? (
-                  <div className="text-center py-8">
-                    <span className="material-symbols-outlined text-[32px] text-red-500">
+                  <div className="text-center py-5">
+                    <span className="material-symbols-outlined text-[28px] text-red-500">
                       error
                     </span>
-                    <p className="mt-2 text-sm text-text-muted">{error}</p>
+                    <p className="mt-1.5 text-xs text-text-muted">{error}</p>
                   </div>
                 ) : quota?.message ? (
-                  <div className="text-center py-8">
-                    <p className="text-sm text-text-muted">{quota.message}</p>
+                  <div className="text-center py-5">
+                    <p className="text-xs text-text-muted">{quota.message}</p>
                   </div>
                 ) : (
-                  <QuotaTable quotas={quota?.quotas} />
+                  <QuotaTable quotas={quota?.quotas} compact />
                 )}
               </div>
             </Card>
           );
         })}
       </div>
+
+      <EditConnectionModal
+        isOpen={showEditModal}
+        connection={selectedConnection}
+        proxyPools={proxyPools}
+        onSave={handleUpdateConnection}
+        onClose={() => {
+          setShowEditModal(false);
+          setSelectedConnection(null);
+        }}
+      />
     </div>
+  );
+}
+
+/**
+ * CooldownBadge — shows "Cooldown Xm Ys" with a live countdown.
+ */
+function CooldownBadge({ until }) {
+  const [remaining, setRemaining] = useState("");
+
+  useEffect(() => {
+    function update() {
+      const diff = until - Date.now();
+      if (diff <= 0) {
+        setRemaining("");
+        return;
+      }
+      const mins = Math.floor(diff / 60000);
+      const secs = Math.floor((diff % 60000) / 1000);
+      setRemaining(mins > 0 ? `${mins}m ${secs}s` : `${secs}s`);
+    }
+
+    update();
+    const timer = setInterval(update, 1000);
+    return () => clearInterval(timer);
+  }, [until]);
+
+  if (!remaining) return null;
+
+  return (
+    <span
+      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-500/15 text-blue-600 dark:text-blue-400 whitespace-nowrap"
+      title="Account is cooling down after quota reset"
+    >
+      <span className="material-symbols-outlined text-[12px]">hourglass_top</span>
+      Cooldown {remaining}
+    </span>
   );
 }
